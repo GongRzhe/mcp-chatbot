@@ -1,3 +1,8 @@
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
 import asyncio
 import json
 import logging
@@ -30,7 +35,21 @@ logging.basicConfig(
 # formatter = logging.Formatter('%(levelname)s: %(message)s')
 # console.setFormatter(formatter)
 # logging.getLogger().addHandler(console)
-
+class TokenUsage:
+    """Tracks token usage across different providers."""
+    
+    def __init__(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+    
+    def update(self, prompt_tokens=0, completion_tokens=0, total_tokens=0):
+        self.prompt_tokens = prompt_tokens or self.prompt_tokens
+        self.completion_tokens = completion_tokens or self.completion_tokens
+        self.total_tokens = total_tokens or (self.prompt_tokens + self.completion_tokens)
+    
+    def __str__(self):
+        return f"[Tokens: {self.prompt_tokens} in, {self.completion_tokens} out, {self.total_tokens} total]"
 
 class ServerState(Enum):
     """Enum representing server connection states."""
@@ -734,6 +753,27 @@ class LLMClient:
         # Health check state
         self.provider_health = {provider: True for provider in self.PROVIDER_CONFIGS.keys()}
         self._health_check_task = None
+        self.last_token_usage = TokenUsage()
+    # Add this method to LLMClient
+    def estimate_tokens(self, text: str, model: str = None) -> int:
+        """Estimate token count using appropriate tokenizer."""
+        model = model or self.model
+        
+        # Use tiktoken for OpenAI/compatible models if available
+        if TIKTOKEN_AVAILABLE and self.provider in ["openai", "groq"]:
+            try:
+                if "gpt-4" in model:
+                    encoding = tiktoken.encoding_for_model("gpt-4")
+                elif "gpt-3.5" in model:
+                    encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+                else:
+                    encoding = tiktoken.get_encoding("cl100k_base")  # Default for newer models
+                return len(encoding.encode(text))
+            except Exception as e:
+                logging.warning(f"Error using tiktoken: {e}")
+        
+        # Fallback approximation
+        return len(text.split()) * 1.3
                 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """Ensure aiohttp session exists and create if needed.
@@ -1235,7 +1275,7 @@ class LLMClient:
             self.available_models[provider] = config["default_models"]
             return config["default_models"]
 
-    async def get_response(self, messages: List[Dict[str, str]]) -> str:
+    async def get_response(self, messages: List[Dict[str, str]]) -> Tuple[str, TokenUsage]:
         """Get a response from the LLM asynchronously.
         
         Args:
@@ -1259,9 +1299,13 @@ class LLMClient:
         try:
             circuit_breaker = self.circuit_breakers[self.provider]
             
-            return await circuit_breaker.execute(
+            # return await circuit_breaker.execute(
+            #     lambda: self.retry_handler.execute(self._get_provider_response, messages)
+            # )
+            response_text = await circuit_breaker.execute(
                 lambda: self.retry_handler.execute(self._get_provider_response, messages)
             )
+            return response_text, self.last_token_usage
         except Exception as e:
             error_message = f"Error getting LLM response: {str(e)}"
             logging.error(error_message)
@@ -1282,7 +1326,8 @@ class LLMClient:
                         logging.error(f"Fallback to {alt_provider} also failed: {fallback_error}")
                         break
             
-            return f"I encountered an error connecting to the language model service. Please try again in a moment. (Error: {error_message})"
+            error_response = f"I encountered an error connecting to the language model service. Please try again in a moment. (Error: {error_message})"
+            return error_response, TokenUsage()  # Return empty token usage on error
 
     async def _get_provider_response(self, messages: List[Dict[str, str]]) -> str:
         """Get a response from the current provider.
@@ -1389,6 +1434,13 @@ class LLMClient:
         session = await self._ensure_session()
         async with session.post(url, headers=headers, json=payload) as response:
             data = await response.json()
+            # Extract token usage (Groq API provides similar structure to OpenAI)
+            if "usage" in data:
+                self.last_token_usage.update(
+                    prompt_tokens=data["usage"].get("prompt_tokens", 0),
+                    completion_tokens=data["usage"].get("completion_tokens", 0),
+                    total_tokens=data["usage"].get("total_tokens", 0)
+                )
             return data['choices'][0]['message']['content']
 
     async def _call_openai(self, messages: List[Dict[str, str]]) -> str:
@@ -1410,8 +1462,18 @@ class LLMClient:
         }
         
         session = await self._ensure_session()
+        # async with session.post(url, headers=headers, json=payload) as response:
+        #     data = await response.json()
+        #     return data['choices'][0]['message']['content']
         async with session.post(url, headers=headers, json=payload) as response:
             data = await response.json()
+            # Extract token usage
+            if "usage" in data:
+                self.last_token_usage.update(
+                    prompt_tokens=data["usage"].get("prompt_tokens", 0),
+                    completion_tokens=data["usage"].get("completion_tokens", 0),
+                    total_tokens=data["usage"].get("total_tokens", 0)
+                )
             return data['choices'][0]['message']['content']
 
     async def _call_anthropic(self, messages: List[Dict[str, str]]) -> str:
@@ -1451,9 +1513,15 @@ class LLMClient:
         async with session.post(url, headers=headers, json=payload) as response:
             data = await response.json()
             
-            # Anthropic API returns content as an array of content blocks
+            # Extract token usage from Anthropic response
+            if "usage" in data:
+                self.last_token_usage.update(
+                    prompt_tokens=data["usage"].get("input_tokens", 0),
+                    completion_tokens=data["usage"].get("output_tokens", 0)
+                )
+            
+            # Existing content extraction...
             if isinstance(data['content'], list) and len(data['content']) > 0:
-                # Get the text from the first content block
                 return data['content'][0]['text']
             else:
                 return "No text content returned from Anthropic API"
@@ -1468,6 +1536,8 @@ class LLMClient:
         
         # Configure the API with the provided key
         genai.configure(api_key=self.api_key)
+        
+        prompt_text = "\n".join([msg.get("content", "") for msg in messages])
         
         # Convert OpenAI message format to Gemini format
         system_content = None
@@ -1582,15 +1652,41 @@ class LLMClient:
                     response = await asyncio.to_thread(model.generate_content, prompt)
             else:
                 raise
-        
         # Extract and return the response text
+        response_text = ""
         if hasattr(response, 'text'):
-            return response.text
+            response_text = response.text
         elif hasattr(response, 'parts') and len(response.parts) > 0:
-            return response.parts[0].text
+            response_text = response.parts[0].text
         else:
-            # Last resort - try to get something usable
-            return str(response)
+            response_text = str(response)
+        
+        # Try to extract token counts from response metadata
+        prompt_tokens = 0
+        completion_tokens = 0
+        
+        # Look for token counts in response object
+        if hasattr(response, 'usage_metadata'):
+            usage = response.usage_metadata
+            if hasattr(usage, 'prompt_token_count'):
+                prompt_tokens = usage.prompt_token_count
+            if hasattr(usage, 'candidates_token_count'):
+                completion_tokens = usage.candidates_token_count
+        
+        # If we couldn't find token info, estimate tokens
+        if prompt_tokens == 0:
+            prompt_tokens = self.estimate_tokens(prompt_text)
+        if completion_tokens == 0:
+            completion_tokens = self.estimate_tokens(response_text)
+        
+        # Update token usage tracker
+        self.last_token_usage.update(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens
+        )
+        
+        return response_text
 
     async def _call_openroute(self, messages: List[Dict[str, str]]) -> str:
         """Call the OpenRoute API asynchronously."""
@@ -1615,6 +1711,28 @@ class LLMClient:
         session = await self._ensure_session()
         async with session.post(url, headers=headers, json=payload) as response:
             data = await response.json()
+            
+            # Extract token usage (OpenRoute follows the OpenAI format)
+            if "usage" in data:
+                self.last_token_usage.update(
+                    prompt_tokens=data["usage"].get("prompt_tokens", 0),
+                    completion_tokens=data["usage"].get("completion_tokens", 0),
+                    total_tokens=data["usage"].get("total_tokens", 0)
+                )
+            else:
+                # If no token info provided, estimate based on content
+                prompt_text = "\n".join([msg.get("content", "") for msg in messages])
+                response_text = data['choices'][0]['message']['content']
+                
+                prompt_tokens = self.estimate_tokens(prompt_text)
+                completion_tokens = self.estimate_tokens(response_text)
+                
+                self.last_token_usage.update(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens
+                )
+            
             return data['choices'][0]['message']['content']
 
     async def _call_ollama(self, messages: List[Dict[str, str]]) -> str:
@@ -1636,12 +1754,47 @@ class LLMClient:
             }
         }
         
+        # session = await self._ensure_session()
+        # async with session.post(url, headers=headers, json=payload) as response:
+        #     data = await response.json()
+        #     if "message" in data:
+        #         return data["message"]["content"]
+        #     return "No text content returned from Ollama API"
         session = await self._ensure_session()
         async with session.post(url, headers=headers, json=payload) as response:
             data = await response.json()
+            
+            response_text = ""
             if "message" in data:
-                return data["message"]["content"]
-            return "No text content returned from Ollama API"
+                response_text = data["message"]["content"]
+            else:
+                response_text = "No text content returned from Ollama API"
+            
+            # Ollama may provide token metrics in these fields
+            prompt_tokens = data.get("prompt_eval_count", 0)
+            completion_tokens = data.get("eval_count", 0)
+            
+            if prompt_tokens > 0 or completion_tokens > 0:
+                # Use actual values if provided
+                self.last_token_usage.update(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens
+                )
+            else:
+                # Estimate using our method if not provided
+                prompt_text = "\n".join([msg.get("content", "") for msg in messages])
+                
+                prompt_tokens = self.estimate_tokens(prompt_text)
+                completion_tokens = self.estimate_tokens(response_text)
+                
+                self.last_token_usage.update(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens
+                )
+                
+            return response_text
 
     def safe_json_serialize(self, obj: Any) -> Any:
         """Safely serialize objects to JSON, handling cases like NaN, Infinity, etc."""
@@ -1875,14 +2028,14 @@ class ChatSession:
                 input_token_count = sum(len(msg["content"].split()) * 1.3 for msg in messages)
                 
                 # Get LLM response
-                llm_response = await self.llm_client.get_response(messages)
+                llm_response, token_usage = await self.llm_client.get_response(messages)
                 
                 # Calculate time taken and output token count (estimated)
                 time_taken = time.time() - start_time
                 output_token_count = len(llm_response.split()) * 1.3
                 
                 # Log stats
-                stats_info = f"\n[Model: {self.llm_client.provider}/{self.llm_client.model}] [Tokens: ~{int(input_token_count)} in, ~{int(output_token_count)} out] [Time: {time_taken:.2f}s]"
+                stats_info = f"\n[Model: {self.llm_client.provider}/{self.llm_client.model}] {token_usage} [Time: {time_taken:.2f}s]"
                 logging.info(stats_info)
                 
                 logging.info("\nAssistant: %s", llm_response)
@@ -1901,14 +2054,14 @@ class ChatSession:
                     # Track start time for final response
                     tool_start_time = time.time()
                     
-                    final_response = await self.llm_client.get_response(messages)
+                    final_response, final_token_usage = await self.llm_client.get_response(messages)
                     
                     # Calculate time and tokens for final response
                     tool_time_taken = time.time() - tool_start_time
                     final_output_tokens = len(final_response.split()) * 1.3
                     
                     # Log final stats
-                    final_stats = f"\n[Model: {self.llm_client.provider}/{self.llm_client.model}] [Tokens: ~{int(input_token_count + output_token_count)} in, ~{int(final_output_tokens)} out] [Time: {tool_time_taken:.2f}s]"
+                    final_stats = f"\n[Model: {self.llm_client.provider}/{self.llm_client.model}] {final_token_usage} [Time: {tool_time_taken:.2f}s]"
                     logging.info(final_stats)
                     
                     logging.info("\nFinal response: %s", final_response)
