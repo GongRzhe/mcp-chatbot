@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import shutil
+import subprocess
 import time
 from copy import deepcopy
 from enum import Enum, auto
@@ -16,7 +17,19 @@ from mcp.client.stdio import stdio_client
 import pydantic
 
 # Configure logging once
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='chatbot.log',
+    filemode='a'
+)
+
+# # Add console handler only for critical errors
+# console = logging.StreamHandler()
+# console.setLevel(logging.ERROR)  # Only show ERROR and CRITICAL
+# formatter = logging.Formatter('%(levelname)s: %(message)s')
+# console.setFormatter(formatter)
+# logging.getLogger().addHandler(console)
 
 
 class ServerState(Enum):
@@ -337,7 +350,9 @@ class Server:
         server_params = StdioServerParameters(
             command=shutil.which("npx") if self.config['command'] == "npx" else self.config['command'],
             args=self.config['args'],
-            env={**os.environ, **self.config['env']} if self.config.get('env') else None
+            env={**os.environ, **self.config['env']} if self.config.get('env') else None,
+            stdout=subprocess.DEVNULL,  # Add this line
+            stderr=subprocess.DEVNULL   # Add this line
         )
         
         try:
@@ -1855,8 +1870,21 @@ class ChatSession:
                 # Apply message history management
                 messages = self._manage_message_history(messages)
                 
+                # Track the start time and input token count (estimated)
+                start_time = time.time()
+                input_token_count = sum(len(msg["content"].split()) * 1.3 for msg in messages)
+                
                 # Get LLM response
                 llm_response = await self.llm_client.get_response(messages)
+                
+                # Calculate time taken and output token count (estimated)
+                time_taken = time.time() - start_time
+                output_token_count = len(llm_response.split()) * 1.3
+                
+                # Log stats
+                stats_info = f"\n[Model: {self.llm_client.provider}/{self.llm_client.model}] [Tokens: ~{int(input_token_count)} in, ~{int(output_token_count)} out] [Time: {time_taken:.2f}s]"
+                logging.info(stats_info)
+                
                 logging.info("\nAssistant: %s", llm_response)
 
                 # Process the response and execute any tools
@@ -1870,18 +1898,30 @@ class ChatSession:
                     # Apply message history management again
                     messages = self._manage_message_history(messages)
                     
+                    # Track start time for final response
+                    tool_start_time = time.time()
+                    
                     final_response = await self.llm_client.get_response(messages)
+                    
+                    # Calculate time and tokens for final response
+                    tool_time_taken = time.time() - tool_start_time
+                    final_output_tokens = len(final_response.split()) * 1.3
+                    
+                    # Log final stats
+                    final_stats = f"\n[Model: {self.llm_client.provider}/{self.llm_client.model}] [Tokens: ~{int(input_token_count + output_token_count)} in, ~{int(final_output_tokens)} out] [Time: {tool_time_taken:.2f}s]"
+                    logging.info(final_stats)
+                    
                     logging.info("\nFinal response: %s", final_response)
                     messages.append({"role": "assistant", "content": final_response})
                     
-                    # Put the final response in the queue
-                    await self.response_queue.put(final_response)
+                    # Put the final response with stats in the queue
+                    await self.response_queue.put(f"{final_response}\n{final_stats}")
                 else:
                     # Add the LLM response to history
                     messages.append({"role": "assistant", "content": llm_response})
                     
-                    # Put the response in the queue
-                    await self.response_queue.put(llm_response)
+                    # Put the response with stats in the queue
+                    await self.response_queue.put(f"{llm_response}\n{stats_info}")
                 
                 # Mark this task as done
                 self.message_queue.task_done()
@@ -1892,7 +1932,7 @@ class ChatSession:
                 logging.error(f"Error in worker: {e}")
                 await self.response_queue.put(f"An error occurred: {str(e)}")
                 self.message_queue.task_done()
-    
+
     async def start_model_refresh(self) -> None:
         """Start a periodic task to refresh models for all providers."""
         if self._model_refresh_task and not self._model_refresh_task.done():
