@@ -754,6 +754,8 @@ class LLMClient:
         self.provider_health = {provider: True for provider in self.PROVIDER_CONFIGS.keys()}
         self._health_check_task = None
         self.last_token_usage = TokenUsage()
+        self.using_default_models = {provider: False for provider in self.provider_registry.providers.keys()}
+
     # Add this method to LLMClient
     def estimate_tokens(self, text: str, model: str = None) -> int:
         """Estimate token count using appropriate tokenizer."""
@@ -775,6 +777,43 @@ class LLMClient:
         # Fallback approximation
         return len(text.split()) * 1.3
                 
+    async def _test_provider_connection(self, provider: str) -> bool:
+        """Test actual API connection without fallbacks.
+        
+        Args:
+            provider: The provider to test
+            
+        Returns:
+            True if connection succeeds, raises exception otherwise
+        """
+        if provider not in self.PROVIDER_CONFIGS:
+            raise ValueError(f"Unsupported provider: {provider}")
+            
+        config = self.PROVIDER_CONFIGS[provider]
+        api_key = None if provider == "ollama" else self.config.get_api_key(provider)
+        
+        if provider == "ollama":
+            url = f"{self.config.ollama_host.rstrip('/')}/api/tags"
+            session = await self._ensure_session()
+            async with session.get(url, timeout=10) as response:
+                response.raise_for_status()
+                return True
+        elif config["models_url"]:
+            headers = config["headers"](api_key)
+            session = await self._ensure_session()
+            async with session.get(config["models_url"], headers=headers, timeout=10) as response:
+                response.raise_for_status()
+                return True
+        else:
+            # For providers without direct URL access (like Gemini)
+            if provider == "gemini":
+                import google.generativeai as genai
+                genai.configure(api_key=api_key)
+                await asyncio.to_thread(genai.list_models)
+                return True
+                
+        return True  # If we get here, connection succeeded
+
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """Ensure aiohttp session exists and create if needed.
         
@@ -890,16 +929,24 @@ class LLMClient:
         Args:
             provider: The provider to check
         """
+        # Store the original models to detect if we're using defaults
+        original_models = self.available_models.get(provider, [])
+        default_models = self.PROVIDER_CONFIGS[provider]["default_models"]
+        
         try:
-            # For health checks, we don't need to store the models
-            # Just check if the API is responsive
-            await self._fetch_available_models(provider)
+            # Try to actually connect to the API
+            api_key = None if provider == "ollama" else self.config.get_api_key(provider)
+            if not api_key and provider != "ollama":
+                self.provider_health[provider] = False
+                return
+                
+            # Test actual API connection - use a separate method to test connection
+            await self._test_provider_connection(provider)
             
-            # If we made it here, the provider is healthy
+            # If connection succeeds, update health status
             was_unhealthy = not self.provider_health.get(provider, True)
             self.provider_health[provider] = True
             
-            # Log recovery if the provider was previously unhealthy
             if was_unhealthy:
                 logging.info(f"Provider {provider} has recovered and is now healthy")
                 
@@ -908,7 +955,6 @@ class LLMClient:
             was_healthy = self.provider_health.get(provider, True)
             self.provider_health[provider] = False
             
-            # Only log warning if this is a new failure
             if was_healthy:
                 logging.warning(f"Health check failed for provider {provider}: {e}")
             else:
@@ -929,7 +975,7 @@ class LLMClient:
         """
         if provider not in self.PROVIDER_CONFIGS:
             raise ValueError(f"Unsupported provider: {provider}")
-            
+        self.provider_health[provider] = False
         # Get provider configuration
         config = self.PROVIDER_CONFIGS[provider]
         
@@ -955,9 +1001,9 @@ class LLMClient:
         try:
             api_key = self.config.get_api_key("groq")
             if not api_key:
-                self.available_models["groq"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["groq"] = False
+                return []
+                    
             headers = {
                 "Authorization": f"Bearer {api_key}"
             }
@@ -966,31 +1012,32 @@ class LLMClient:
             async with session.get(config["models_url"], headers=headers) as response:
                 data = await response.json()
                 logging.debug(f"Groq API response: {data}")
-                
+                    
                 if "data" in data and isinstance(data["data"], list):
                     models = [model["id"] for model in data["data"] if "id" in model]
                     
                     if models:
                         self.available_models["groq"] = models
+                        self.provider_health["groq"] = True
                         return models
-                
+                    
                 logging.warning("Could not extract models from Groq API response")
-                self.available_models["groq"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["groq"] = False
+                return []
+                    
         except Exception as e:
             logging.warning(f"Error fetching Groq models: {e}")
-            self.available_models["groq"] = config["default_models"]
-            return config["default_models"]
-    
+            self.provider_health["groq"] = False
+            return []
+
     async def _fetch_openai_models(self, config: Dict[str, Any]) -> List[str]:
         """Fetch OpenAI models with specialized handling."""
         try:
             api_key = self.config.get_api_key("openai")
             if not api_key:
-                self.available_models["openai"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["openai"] = False
+                return []
+                    
             headers = {
                 "Authorization": f"Bearer {api_key}"
             }
@@ -999,69 +1046,71 @@ class LLMClient:
             async with session.get(config["models_url"], headers=headers) as response:
                 data = await response.json()
                 logging.debug(f"OpenAI API response: {data}")
-                
+                    
                 if "data" in data and isinstance(data["data"], list):
                     # Filter for only GPT models
                     models = [m["id"] for m in data["data"] if "id" in m and "gpt" in m["id"].lower()]
                     
                     if models:
                         self.available_models["openai"] = models
+                        self.provider_health["openai"] = True
                         return models
-                
+                    
                 logging.warning("Could not extract models from OpenAI API response")
-                self.available_models["openai"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["openai"] = False
+                return []
+                    
         except Exception as e:
             logging.warning(f"Error fetching OpenAI models: {e}")
-            self.available_models["openai"] = config["default_models"]
-            return config["default_models"]
+            self.provider_health["openai"] = False
+            return []
         
     async def _fetch_gemini_models(self, config: Dict[str, Any]) -> List[str]:
         """Fetch Gemini models using the official Google SDK."""
         try:
             api_key = self.config.get_api_key("gemini")
             if not api_key:
-                self.available_models["gemini"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["gemini"] = False
+                return []
+                    
             # Using the official Google SDK to get models
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=api_key)
-                
+                    
                 # Use asyncio.to_thread to run the blocking SDK call in a separate thread
                 models = await asyncio.to_thread(genai.list_models)
-                
+                    
                 if models:
                     # Filter for only Gemini models
                     gemini_models = [model.name for model in models if "gemini" in model.name.lower()]
                     
                     if gemini_models:
                         self.available_models["gemini"] = gemini_models
+                        self.provider_health["gemini"] = True
                         return gemini_models
             except ImportError:
-                logging.warning("Google GenerativeAI SDK not installed. Using default models.")
+                logging.warning("Google GenerativeAI SDK not installed.")
             except Exception as sdk_err:
                 logging.warning(f"Error using Google SDK: {sdk_err}")
             
-            # Fallback to defaults
-            self.available_models["gemini"] = config["default_models"]
-            return config["default_models"]
-                
+            # If we get here, something failed
+            self.provider_health["gemini"] = False
+            return []
+                    
         except Exception as e:
             logging.warning(f"Error fetching Gemini models: {e}")
-            self.available_models["gemini"] = config["default_models"]
-            return config["default_models"]
-    
+            self.provider_health["gemini"] = False
+            return []
+
     async def _fetch_anthropic_models(self, config: Dict[str, Any]) -> List[str]:
         """Fetch Anthropic models with specialized handling."""
         try:
             api_key = self.config.get_api_key("anthropic")
             if not api_key:
-                self.available_models["anthropic"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["anthropic"] = False
+                return []
+                    
             headers = {
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01"
@@ -1071,31 +1120,32 @@ class LLMClient:
             async with session.get(config["models_url"], headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 data = await response.json()
                 logging.debug(f"Anthropic API response: {data}")
-                
+                    
                 if "data" in data and isinstance(data["data"], list):
                     models = [model["id"] for model in data["data"] if "id" in model]
                     
                     if models:
                         self.available_models["anthropic"] = models
+                        self.provider_health["anthropic"] = True
                         return models
-                
+                    
                 logging.warning("Could not extract models from Anthropic API response")
-                self.available_models["anthropic"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["anthropic"] = False
+                return []
+                    
         except Exception as e:
             logging.warning(f"Error fetching Anthropic models: {e}")
-            self.available_models["anthropic"] = config["default_models"]
-            return config["default_models"]
+            self.provider_health["anthropic"] = False
+            return []
 
     async def _fetch_openroute_models(self, config: Dict[str, Any]) -> List[str]:
         """Fetch OpenRoute models with specialized handling."""
         try:
             api_key = self.config.get_api_key("openroute")
             if not api_key:
-                self.available_models["openroute"] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health["openroute"] = False
+                return []
+                    
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "HTTP-Referer": "http://localhost",
@@ -1107,7 +1157,7 @@ class LLMClient:
                 data = await response.json()
                 logging.debug(f"OpenRoute API response type: {type(data)}")
                 logging.debug(f"OpenRoute API response: {data}")
-                
+                    
                 models = []
                 # Handle different possible response formats
                 if isinstance(data, list):
@@ -1126,154 +1176,129 @@ class LLMClient:
                         for model in data["models"]:
                             if isinstance(model, dict) and "id" in model:
                                 models.append(model["id"])
-                
+                    
                 if models:
                     self.available_models["openroute"] = models
+                    self.provider_health["openroute"] = True
                     return models
-                
+                    
                 logging.warning("Could not extract models from OpenRoute API response")
-                self.available_models["openroute"] = config["default_models"]
-                return config["default_models"]
+                self.provider_health["openroute"] = False
+                return []
         except Exception as e:
             logging.warning(f"Error fetching OpenRoute models: {e}")
-            self.available_models["openroute"] = config["default_models"]
-            return config["default_models"]
+            self.provider_health["openroute"] = False
+            return []
 
     async def _fetch_ollama_models(self, config: Dict[str, Any]) -> List[str]:
-        """
-        Fetch Ollama models from API with improved error handling and response processing.
-        
-        According to official Ollama API documentation, /api/tags is the correct endpoint
-        to list locally available models. This implementation also handles alternate URL
-        formats in case of custom configurations.
-        
-        Args:
-            config: Configuration dictionary containing default models and settings
-            
-        Returns:
-            List of available Ollama model names
-        """
-        # Validate configuration
-        default_models = config.get("default_models", [])
-        if not isinstance(default_models, list):
-            logging.error("Invalid default_models in config (not a list)")
-            return []
-        
+        """Fetch Ollama models from API with improved error handling and response processing."""
         # Get and normalize Ollama host URL
         ollama_host = self.config.ollama_host or "http://localhost:11434"
         ollama_host = ollama_host.rstrip('/')
         logging.debug(f"Base Ollama host URL: {ollama_host}")
-        
+            
         # Define potential API endpoints to try
         standard_endpoint = f"{ollama_host}/api/tags"
         alternate_endpoint = f"{ollama_host}/v1/api/tags"
-        
+            
         # Get session with proper error handling
         try:
             session = await self._ensure_session()
         except Exception as e:
             logging.error(f"Failed to create HTTP session: {e}")
-            self.available_models["ollama"] = default_models
-            return default_models
-        
+            self.provider_health["ollama"] = False
+            return []
+            
         # Define timeout
         timeout = aiohttp.ClientTimeout(total=15)
-        
+            
         # Try standard endpoint first
         logging.debug(f"Attempting to fetch models from standard endpoint: {standard_endpoint}")
         try:
-            return await self._try_fetch_from_endpoint(session, standard_endpoint, timeout, default_models)
+            models = await self._try_fetch_from_endpoint(session, standard_endpoint, timeout, [])
+            if models:
+                self.provider_health["ollama"] = True
+                return models
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
                 logging.info(f"Standard endpoint returned 404, trying alternate endpoint with /v1/ prefix")
                 try:
-                    return await self._try_fetch_from_endpoint(session, alternate_endpoint, timeout, default_models)
+                    models = await self._try_fetch_from_endpoint(session, alternate_endpoint, timeout, [])
+                    if models:
+                        self.provider_health["ollama"] = True
+                        return models
                 except Exception as e2:
                     logging.error(f"Failed to fetch models from alternate endpoint: {e2}")
             else:
                 logging.error(f"HTTP error with Ollama API: {e.status}, message='{e.message}'")
         except Exception as e:
             logging.error(f"Error fetching models from standard endpoint: {e}")
-        
-        # If all endpoints failed, use defaults
-        logging.warning("All Ollama API endpoints failed, using default models list")
-        self.available_models["ollama"] = default_models
-        return default_models
+            
+        # If all endpoints failed, mark as unhealthy
+        logging.warning("All Ollama API endpoints failed")
+        self.provider_health["ollama"] = False
+        return []
 
     async def _try_fetch_from_endpoint(self, session, endpoint, timeout, default_models):
-        """
-        Helper method to try fetching models from a specific endpoint.
-        
-        Args:
-            session: HTTP client session
-            endpoint: API endpoint URL
-            timeout: Request timeout
-            default_models: Default models to use if request fails
-            
-        Returns:
-            List of model names
-            
-        Raises:
-            Exception: If the request fails in any way
-        """
+        """Helper method to try fetching models from a specific endpoint."""
         async with session.get(endpoint, timeout=timeout) as response:
             response.raise_for_status()
-            
+                
             # Parse JSON response
             data = await response.json()
             logging.debug(f"Ollama API response from {endpoint}: {data}")
-            
+                
             # Extract model names from the response
             models = []
-            
+                
             if isinstance(data, dict) and "models" in data and isinstance(data["models"], list):
                 # Process API format
                 for model in data["models"]:
                     if isinstance(model, dict) and "name" in model:
                         models.append(model["name"])
-            
+                
             if models:
                 logging.info(f"Successfully fetched {len(models)} models from {endpoint}")
                 self.available_models["ollama"] = models
                 return models
             else:
                 logging.warning(f"No models found in response from {endpoint}")
-                self.available_models["ollama"] = default_models
-                return default_models
-        
+                return []
+
     async def _fetch_generic_models(self, provider: str, config: Dict[str, Any]) -> List[str]:
         """Generic model fetching for other providers."""
         try:
             api_key = self.config.get_api_key(provider)
             if not api_key:
-                self.available_models[provider] = config["default_models"]
-                return config["default_models"]
-                
+                self.provider_health[provider] = False
+                return []
+                    
             # Prepare headers using the config's header function
             headers = config["headers"](api_key)
-            
+                
             session = await self._ensure_session()
             async with session.get(config["models_url"], headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 data = await response.json()
                 logging.debug(f"{provider.capitalize()} API response: {data}")
-                
+                    
                 # Use the provider's extractor function to get models
                 try:
                     models = config["models_extractor"](data)
-                    
+                        
                     if models:
                         self.available_models[provider] = models
+                        self.provider_health[provider] = True
                         return models
                 except Exception as e:
                     logging.warning(f"Error extracting models for {provider}: {e}")
-                
-                # Fallback to defaults
-                self.available_models[provider] = config["default_models"]
-                return config["default_models"]
+                    
+                # If extraction failed, mark as unhealthy
+                self.provider_health[provider] = False
+                return []
         except Exception as e:
             logging.warning(f"Error fetching models for {provider}: {e}")
-            self.available_models[provider] = config["default_models"]
-            return config["default_models"]
+            self.provider_health[provider] = False
+            return []
 
     async def get_response(self, messages: List[Dict[str, str]]) -> Tuple[str, TokenUsage]:
         """Get a response from the LLM asynchronously.
@@ -1285,16 +1310,20 @@ class LLMClient:
             The LLM's response as a string.
         """
         # Check if we need to reconnect to a different provider
+        # if not self.provider_health[self.provider]:
+        #     logging.warning(f"Current provider {self.provider} is unhealthy")
+            
+        #     # Find a healthy alternative provider
+        #     for alt_provider, is_healthy in self.provider_health.items():
+        #         if is_healthy and (alt_provider == "ollama" or self.config.get_api_key(alt_provider)):
+        #             logging.info(f"Switching to healthy provider: {alt_provider}")
+        #             await self.change_provider(alt_provider)
+        #             break
         if not self.provider_health[self.provider]:
             logging.warning(f"Current provider {self.provider} is unhealthy")
+            # Just log the warning without auto-switching
+            logging.info("Use '/switch <provider> <model>' to manually change providers")
             
-            # Find a healthy alternative provider
-            for alt_provider, is_healthy in self.provider_health.items():
-                if is_healthy and (alt_provider == "ollama" or self.config.get_api_key(alt_provider)):
-                    logging.info(f"Switching to healthy provider: {alt_provider}")
-                    await self.change_provider(alt_provider)
-                    break
-        
         # Use retry mechanism with circuit breaker for resiliency
         try:
             circuit_breaker = self.circuit_breakers[self.provider]
@@ -1314,18 +1343,19 @@ class LLMClient:
             self.provider_health[self.provider] = False
             
             # Try to find a fallback provider
-            for alt_provider, is_healthy in self.provider_health.items():
-                if is_healthy and alt_provider != self.provider and (
-                    alt_provider == "ollama" or self.config.get_api_key(alt_provider)
-                ):
-                    logging.info(f"Falling back to alternative provider: {alt_provider}")
-                    try:
-                        await self.change_provider(alt_provider)
-                        return await self.retry_handler.execute(self._get_provider_response, messages)
-                    except Exception as fallback_error:
-                        logging.error(f"Fallback to {alt_provider} also failed: {fallback_error}")
-                        break
-            
+            # for alt_provider, is_healthy in self.provider_health.items():
+            #     if is_healthy and alt_provider != self.provider and (
+            #         alt_provider == "ollama" or self.config.get_api_key(alt_provider)
+            #     ):
+            #         logging.info(f"Falling back to alternative provider: {alt_provider}")
+            #         try:
+            #             await self.change_provider(alt_provider)
+            #             return await self.retry_handler.execute(self._get_provider_response, messages)
+            #         except Exception as fallback_error:
+            #             logging.error(f"Fallback to {alt_provider} also failed: {fallback_error}")
+            #             break
+            # Just log the error without auto-switching
+            logging.error("Connection to current provider failed. Use '/switch <provider> <model>' to change providers")
             error_response = f"I encountered an error connecting to the language model service. Please try again in a moment. (Error: {error_message})"
             return error_response, TokenUsage()  # Return empty token usage on error
 
@@ -1368,15 +1398,7 @@ class LLMClient:
             raise
     
     async def change_provider(self, provider: str, model: str = None) -> None:
-        """Change the LLM provider and model asynchronously.
-        
-        Args:
-            provider: The new provider name.
-            model: The new model name (optional).
-            
-        Raises:
-            ValueError: If the provider or model is not supported.
-        """
+        """Change the LLM provider and model asynchronously."""
         # Check if provider is supported
         if provider.lower() not in self.PROVIDER_CONFIGS:
             supported = ", ".join(self.PROVIDER_CONFIGS.keys())
@@ -1384,24 +1406,30 @@ class LLMClient:
         
         # Set the provider
         provider = provider.lower()
-        self.provider = provider
         
-        # Fetch available models for this provider if we haven't already
-        if provider not in self.available_models:
+        # Fetch available models for this provider if needed
+        if provider not in self.available_models or not self.available_models[provider]:
             try:
                 await self._fetch_available_models(provider)
             except Exception as e:
                 logging.warning(f"Could not fetch models for {provider}: {e}")
-                # Use default models as fallback
-                self.available_models[provider] = self.PROVIDER_CONFIGS[provider]["default_models"]
+                # No fallback to default models
+                self.available_models[provider] = []
         
-        # Check if model is supported for this provider and set it
+        # Make sure there are models available
+        if not self.available_models[provider]:
+            raise ValueError(f"No models available for {provider}. API connection may have failed.")
+        
+        # Update the provider
+        self.provider = provider
+        
+        # Check if model is supported and set it
         if model:
             if model not in self.available_models[provider]:
                 raise ValueError(f"Model '{model}' is not available for {provider}. Use /llm to see available models.")
             self.model = model
         else:
-            # If no model specified, use the first available model for this provider
+            # Use the first available model
             self.model = self.available_models[provider][0]
         
         # Set the API key
@@ -1409,7 +1437,7 @@ class LLMClient:
             self.api_key = self.config.get_api_key(provider)
         else:
             self.api_key = None
-            
+                
         logging.info(f"Switched to {provider} provider with model {self.model}")
 
     async def _call_groq(self, messages: List[Dict[str, str]]) -> str:
@@ -1942,31 +1970,32 @@ class ChatSession:
         for provider in self.llm_client.PROVIDER_CONFIGS.keys():
             # Check if API key is available (except for Ollama which doesn't need one)
             api_key_status = "✓" if provider == "ollama" or self.llm_client.config.get_api_key(provider) else "✗"
-            
+            health_status = "🟢" if self.llm_client.provider_health.get(provider, False) else "🔴"
+                
             if provider == self.llm_client.provider:
-                print(f"\n🔹 {provider.upper()} {api_key_status}")
+                print(f"\n🔹 {provider.upper()} {api_key_status} {health_status}")
             else:
-                print(f"\n• {provider.upper()} {api_key_status}")
+                print(f"\n• {provider.upper()} {api_key_status} {health_status}")
             
             # Get models for this provider
             models = self.llm_client.available_models.get(provider, [])
             
-            # If we couldn't fetch any models, show the defaults
-            if not models:
-                models = self.llm_client.PROVIDER_CONFIGS[provider]["default_models"]
-                print("  (Using default models - API may be unavailable)")
-                
-            # Print models with the current one highlighted (limit to 10)
-            for model in models[:10]:  # Limit to first 10 models to avoid flooding the console
-                if provider == self.llm_client.provider and model == self.llm_client.model:
-                    print(f"   ➜ {model}")
-                else:
-                    print(f"     {model}")
-                    
-            # If there are more models, indicate this
-            remaining = len(models) - 10
-            if remaining > 0:
-                print(f"     ... and {remaining} more models")
+            # Only show models if the provider is healthy
+            if self.llm_client.provider_health.get(provider, False) and models:
+                # Print models with the current one highlighted (limit to 10)
+                for model in models[:10]:
+                    if provider == self.llm_client.provider and model == self.llm_client.model:
+                        print(f"   ➜ {model}")
+                    else:
+                        print(f"     {model}")
+                        
+                # If there are more models, indicate this
+                remaining = len(models) - 10
+                if remaining > 0:
+                    print(f"     ... and {remaining} more models")
+            else:
+                # No models available - show error
+                print("   No models available - API connection failed")
             
             # If no API key is available, add a note
             if api_key_status == "✗" and provider != "ollama":
@@ -1975,6 +2004,8 @@ class ChatSession:
         print("\nUse '/switch <provider> <model>' to change the LLM")
         print("Example: /switch openai gpt-4o")
         print("\nAPI Key Status: ✓ = configured, ✗ = missing")
+        # Add after line 2254 (after "API Key Status" legend)
+        print("Health Status: 🟢 = healthy, 🔴 = unhealthy")
     
     def _manage_message_history(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Maintain message history within limits to prevent token overflow.
@@ -2240,12 +2271,36 @@ Please use only the tools that are explicitly defined above."""
                         print("Model refresh complete")
                         self.display_llm_list()
                         continue
-                    
+                    elif user_input.lower() == "/tools":
+                        print("\n===== Available MCP Tools =====")
+                        all_tools = []
+                        for server in self.servers:
+                            if server.state == ServerState.CONNECTED:
+                                tools = await server.list_tools()
+                                if tools:
+                                    print(f"\n{server.name} Server Tools:")
+                                    for tool in tools:
+                                        print(f"  • {tool.name} - {tool.description}")
+                                        all_tools.append(tool)
+                        
+                        if not all_tools:
+                            print("  No tools available. Servers may not be connected.")
+                        print(f"\nTotal available tools: {len(all_tools)}")
+                        continue
+
+                    elif user_input.lower() == "/now":
+                        print(f"\nCurrent LLM: {self.llm_client.provider.upper()} - {self.llm_client.model}")
+                        if hasattr(self.llm_client, 'last_token_usage'):
+                            print(f"Last token usage: {self.llm_client.last_token_usage}")
+                        print(f"Provider health status: {'✅ Healthy' if self.llm_client.provider_health.get(self.llm_client.provider, False) else '❌ Unhealthy'}")
+                        continue
                     elif user_input.lower() == "/help":
                         print("\n===== Available Commands =====")
                         print("  /llm                      - Show available LLM providers and models")
                         print("  /switch <provider> <model> - Switch to a different LLM")
                         print("  /refresh                  - Refresh model lists for all providers")
+                        print("  /tools                    - Show available MCP tools")  # New command
+                        print("  /now                      - Show current LLM details")  # New command
                         print("  /help                     - Show this help message")
                         print("  quit or exit              - Exit the chat")
                         continue
